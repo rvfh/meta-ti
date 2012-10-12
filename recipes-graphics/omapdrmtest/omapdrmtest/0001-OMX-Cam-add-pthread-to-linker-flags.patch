@@ -1,0 +1,27 @@
+From cb224b35f59a9ab9cd2ec8905de3ba9cded60ea2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Herv=C3=A9=20Fache?= <h-fache@ti.com>
+Date: Fri, 12 Oct 2012 10:29:44 +0200
+Subject: [PATCH] OMX Cam: add pthread to linker flags
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Signed-off-by: Hervé Fache <h-fache@ti.com>
+---
+ omx_cam/Makefile.am |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git a/omx_cam/Makefile.am b/omx_cam/Makefile.am
+index 333432b..cd02fab 100644
+--- a/omx_cam/Makefile.am
++++ b/omx_cam/Makefile.am
+@@ -13,5 +13,5 @@ omx_cam_test_SOURCES = \
+ 	VisionCamSimpleTest.cpp \
+ 	$(NULL)
+ 
+-omx_cam_test_LDADD = ../util/libutil.la @DOMX_LIBS@
++omx_cam_test_LDADD = ../util/libutil.la @DOMX_LIBS@ -lpthread
+ endif
+-- 
+1.7.0.4
+
