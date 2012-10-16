@@ -1,0 +1,25 @@
+From 81fb47843d0195409d7d00b5e5cfcbad2dd9e2d1 Mon Sep 17 00:00:00 2001
+From: Rob Clark <rob.clark@linaro.org>
+Date: Wed, 28 Mar 2012 15:43:05 -0500
+Subject: [PATCH 2/4] fix typo
+
+---
+ configure.ac |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/configure.ac b/configure.ac
+index f1ce092..67f7e25 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -41,7 +41,7 @@ XORG_MACROS_VERSION(1.8)
+ XORG_DEFAULT_OPTIONS
+ XORG_CHECK_MALLOC_ZERO
+ 
+-# Obtain compiler/linker options for depedencies
++# Obtain compiler/linker options for dependencies
+ PKG_CHECK_MODULES(DRI2, x11 xext xextproto libdrm)
+ 
+ # Optionally enable simple test app...
+-- 
+1.7.9.5
+
