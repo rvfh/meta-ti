@@ -1,0 +1,34 @@
+From 12050273504b132c4073d5a025ad5232a19d2b5a Mon Sep 17 00:00:00 2001
+From: Rob Clark <rob.clark@linaro.org>
+Date: Fri, 8 Jun 2012 14:46:11 -0500
+Subject: [PATCH 3/4] Fix potential NPE if user doesn't register display
+
+---
+ src/dri2.c |   11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/dri2.c b/src/dri2.c
+index e08caef..65cd497 100644
+--- a/src/dri2.c
++++ b/src/dri2.c
+@@ -218,8 +218,15 @@ DRI2QueryVersion(Display * dpy, int *major, int *minor)
+       SyncHandle();
+       return False;
+    }
+-   dri2dpy->major = *major = rep.majorVersion;
+-   dri2dpy->minor = *minor = rep.minorVersion;
++
++   *major = rep.majorVersion;
++   *minor = rep.minorVersion;
++
++   if (dri2dpy) {
++	   dri2dpy->major = rep.majorVersion;
++	   dri2dpy->minor = rep.minorVersion;
++   }
++
+    UnlockDisplay(dpy);
+    SyncHandle();
+ 
+-- 
+1.7.9.5
+
