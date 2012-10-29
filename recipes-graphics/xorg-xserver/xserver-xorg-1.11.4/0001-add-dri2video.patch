@@ -1,0 +1,1182 @@
+From 1301542b17a9ea3cc185e24a3e40d33daa66e8ce Mon Sep 17 00:00:00 2001
+From: Rob Clark <rob@ti.com>
+Date: Tue, 15 Nov 2011 14:28:06 -0600
+Subject: [PATCH] add dri2video
+
+TODO:
+ + implement OSD support.. core should register damage and automatically
+   re-call ScheduleSwapVid..
+ + automatically re-call ScheduleSwapVid on dri2 drawable resize...
+---
+ hw/xfree86/dri2/dri2.c    |  364 +++++++++++++++++++++++++++++++++++++--------
+ hw/xfree86/dri2/dri2.h    |  127 ++++++++++++++++-
+ hw/xfree86/dri2/dri2ext.c |  214 +++++++++++++++++++++++++-
+ 3 files changed, 632 insertions(+), 73 deletions(-)
+
+Index: xserver/hw/xfree86/dri2/dri2.c
+===================================================================
+--- xserver.orig/hw/xfree86/dri2/dri2.c	2012-02-22 11:04:26.000000000 +0100
++++ xserver/hw/xfree86/dri2/dri2.c	2012-02-22 16:32:28.000000000 +0100
+@@ -91,6 +91,8 @@
+     int				 refcnt;
+     unsigned int		 numDrivers;
+     const char			**driverNames;
++    unsigned int		 numFormats;
++    unsigned int		*formats;
+     const char			*deviceName;
+     int				 fd;
+     unsigned int		 lastSequence;
+@@ -102,12 +104,29 @@
+     DRI2GetMSCProcPtr		 GetMSC;
+     DRI2ScheduleWaitMSCProcPtr	 ScheduleWaitMSC;
+     DRI2AuthMagicProcPtr	 AuthMagic;
++    DRI2ReuseBufferNotifyProcPtr ReuseBufferNotify;
++    DRI2SwapLimitValidateProcPtr SwapLimitValidate;
++    DRI2GetExtraBufferNamesProcPtr GetExtraBufferNames;
++    DRI2CreateBufferVidProcPtr  CreateBufferVid;
++    DRI2ScheduleSwapVidProcPtr  ScheduleSwapVid;
++    DRI2SetAttributeProcPtr     SetAttribute;
++    DRI2GetAttributeProcPtr     GetAttribute;
+ 
+     HandleExposuresProcPtr       HandleExposures;
+ 
+     ConfigNotifyProcPtr		 ConfigNotify;
+ } DRI2ScreenRec;
+ 
++static Bool
++supports_video(DRI2ScreenPtr ds)
++{
++    /* it would be easier if we had a way to track the driverType in the
++     * DRI2DrawablePtr.. but the DRI2DrawablePtr isn't created at the
++     * time of DRI2Connect()..
++     */
++    return ds && ds->numFormats && ds->CreateBufferVid && ds->ScheduleSwapVid;
++}
++
+ static DRI2ScreenPtr
+ DRI2GetScreen(ScreenPtr pScreen)
+ {
+@@ -179,6 +198,7 @@
+     pPriv->last_swap_ust = 0;
+     list_init(&pPriv->reference_list);
+     pPriv->serialNumber = DRI2DrawableSerial(pDraw);
++    pPriv->needInvalidate = FALSE;
+ 
+     if (pDraw->type == DRAWABLE_WINDOW) {
+ 	pWin = (WindowPtr) pDraw;
+@@ -191,6 +211,35 @@
+     return pPriv;
+ }
+ 
++Bool
++DRI2SwapLimit(DrawablePtr pDraw, int swap_limit)
++{
++    DRI2DrawablePtr pPriv = DRI2GetDrawable(pDraw);
++    DRI2ScreenPtr ds;
++    if (!pPriv)
++	return FALSE;
++
++    ds = pPriv->dri2_screen;
++
++    if (!ds->SwapLimitValidate
++	|| !ds->SwapLimitValidate(pDraw, swap_limit))
++	return FALSE;
++
++    pPriv->swap_limit = swap_limit;
++
++    /* Check throttling */
++    if (pPriv->swapsPending >= pPriv->swap_limit)
++	return TRUE;
++
++    if (pPriv->target_sbc == -1 && !pPriv->blockedOnMsc) {
++	if (pPriv->blockedClient) {
++	    AttendClient(pPriv->blockedClient);
++	    pPriv->blockedClient = NULL;
++	}
++    }
++
++    return TRUE;
++}
+ typedef struct DRI2DrawableRefRec {
+     XID		  id;
+     XID		  dri2_id;
+@@ -264,15 +313,26 @@
+     return Success;
+ }
+ 
++static void destroy_buffers(DrawablePtr pDraw, DRI2BufferPtr *buffers, int count)
++{
++    if (buffers != NULL) {
++	DRI2ScreenPtr ds = DRI2GetScreen(pDraw->pScreen);
++	int i;
++	for (i = 0; i < count; i++)
++	    if (buffers[i])
++		(*ds->DestroyBuffer)(pDraw, buffers[i]);
++
++	free(buffers);
++    }
++}
++
+ static int DRI2DrawableGone(pointer p, XID id)
+ {
+     DRI2DrawablePtr pPriv = p;
+-    DRI2ScreenPtr   ds = pPriv->dri2_screen;
+     DRI2DrawableRefPtr ref, next;
+     WindowPtr pWin;
+     PixmapPtr pPixmap;
+     DrawablePtr pDraw;
+-    int i;
+ 
+     list_for_each_entry_safe(ref, next, &pPriv->reference_list, link) {
+ 	if (ref->dri2_id == id) {
+@@ -304,12 +364,7 @@
+ 	dixSetPrivate(&pPixmap->devPrivates, dri2PixmapPrivateKey, NULL);
+     }
+ 
+-    if (pPriv->buffers != NULL) {
+-	for (i = 0; i < pPriv->bufferCount; i++)
+-	    (*ds->DestroyBuffer)(pDraw, pPriv->buffers[i]);
+-
+-	free(pPriv->buffers);
+-    }
++    destroy_buffers(pDraw, pPriv->buffers, pPriv->bufferCount);
+ 
+     free(pPriv);
+ 
+@@ -317,7 +372,7 @@
+ }
+ 
+ static int
+-find_attachment(DRI2DrawablePtr pPriv, unsigned attachment)
++find_attachment(DRI2DrawablePtr pPriv, unsigned attachment, DRI2BufferPtr *buf)
+ {
+     int i;
+ 
+@@ -328,6 +383,8 @@
+     for (i = 0; i < pPriv->bufferCount; i++) {
+ 	if ((pPriv->buffers[i] != NULL)
+ 	    && (pPriv->buffers[i]->attachment == attachment)) {
++	    if (buf)
++		*buf = pPriv->buffers[i];
+ 	    return i;
+ 	}
+     }
+@@ -336,14 +393,27 @@
+ }
+ 
+ static Bool
++valid_format(DRI2ScreenPtr ds, unsigned int format)
++{
++    int i;
++    for (i = 0; i < ds->numFormats; i++) {
++	if (format == ds->formats[i]) {
++	    return TRUE;
++	}
++    }
++    return FALSE;
++}
++
++static Bool
+ allocate_or_reuse_buffer(DrawablePtr pDraw, DRI2ScreenPtr ds,
+ 			 DRI2DrawablePtr pPriv,
+ 			 unsigned int attachment, unsigned int format,
+ 			 int dimensions_match, DRI2BufferPtr *buffer)
+ {
+-    int old_buf = find_attachment(pPriv, attachment);
++    int old_buf = find_attachment(pPriv, attachment, NULL);
+ 
+     if ((old_buf < 0)
++	|| attachment == DRI2BufferFrontLeft
+ 	|| !dimensions_match
+ 	|| (pPriv->buffers[old_buf]->format != format)) {
+ 	*buffer = (*ds->CreateBuffer)(pDraw, attachment, format);
+@@ -352,6 +422,8 @@
+ 
+     } else {
+ 	*buffer = pPriv->buffers[old_buf];
++	if (ds->ReuseBufferNotify)
++		(*ds->ReuseBufferNotify)(pDraw, *buffer);
+ 	pPriv->buffers[old_buf] = NULL;
+ 	return FALSE;
+     }
+@@ -361,18 +433,7 @@
+ update_dri2_drawable_buffers(DRI2DrawablePtr pPriv, DrawablePtr pDraw,
+ 			     DRI2BufferPtr *buffers, int out_count, int *width, int *height)
+ {
+-    DRI2ScreenPtr   ds = DRI2GetScreen(pDraw->pScreen);
+-    int i;
+-
+-    if (pPriv->buffers != NULL) {
+-	for (i = 0; i < pPriv->bufferCount; i++) {
+-	    if (pPriv->buffers[i] != NULL) {
+-		(*ds->DestroyBuffer)(pDraw, pPriv->buffers[i]);
+-	    }
+-	}
+-
+-	free(pPriv->buffers);
+-    }
++    destroy_buffers(pDraw, pPriv->buffers, pPriv->bufferCount);
+ 
+     pPriv->buffers = buffers;
+     pPriv->bufferCount = out_count;
+@@ -417,6 +478,15 @@
+ 	const unsigned attachment = *(attachments++);
+ 	const unsigned format = (has_format) ? *(attachments++) : 0;
+ 
++	/* note: don't require a valid format for old drivers which don't
++	 * register their supported formats..
++	 */
++	if (has_format && (ds->numFormats > 0) && !valid_format(ds, format)) {
++	    xf86DrvMsg(pDraw->pScreen->myNum, X_ERROR,
++		    "[DRI2] %s: bad format: %d\n", __func__, format);
++	    goto err_out;
++	}
++
+ 	if (allocate_or_reuse_buffer(pDraw, ds, pPriv, attachment,
+ 				     format, dimensions_match,
+ 				     &buffers[i]))
+@@ -506,19 +576,11 @@
+ 
+     *out_count = 0;
+ 
+-    if (buffers) {
+-	for (i = 0; i < count; i++) {
+-	    if (buffers[i] != NULL)
+-		(*ds->DestroyBuffer)(pDraw, buffers[i]);
+-	}
++    destroy_buffers(pDraw, buffers, count);
+ 
+-	free(buffers);
+-	buffers = NULL;
+-    }
++    update_dri2_drawable_buffers(pPriv, pDraw, NULL, *out_count, width, height);
+ 
+-    update_dri2_drawable_buffers(pPriv, pDraw, buffers, *out_count, width, height);
+-
+-    return buffers;
++    return NULL;
+ }
+ 
+ DRI2BufferPtr *
+@@ -537,6 +599,95 @@
+ 			  out_count, TRUE);
+ }
+ 
++DRI2BufferPtr *
++DRI2GetBuffersVid(DrawablePtr pDraw, int width, int height,
++	unsigned int *attachments, int count, int *out_count)
++{
++    DRI2ScreenPtr   ds = DRI2GetScreen(pDraw->pScreen);
++    DRI2DrawablePtr pPriv = DRI2GetDrawable(pDraw);
++    DRI2BufferPtr  *buffers;
++    int i, n = 0;
++
++    if (!pPriv || !supports_video(ds)) {
++	*out_count = 0;
++	return NULL;
++    }
++
++    buffers = calloc(count, sizeof(buffers[0]));
++    if (!buffers)
++	goto err_out;
++
++    for (i = 0; i < count; i++) {
++	DRI2BufferPtr buf;
++	const unsigned attachment = *(attachments++);
++	const unsigned format = *(attachments++);
++
++	/* grow array of stored buffers if needed: */
++	if (attachment >= pPriv->bufferCount) {
++	    int n = attachment + 1;
++	    DRI2BufferPtr *newBuffers = realloc(pPriv->buffers,
++		    sizeof(pPriv->buffers[0]) * n);
++	    if (!newBuffers) {
++		xf86DrvMsg(pDraw->pScreen->myNum, X_ERROR,
++			"[DRI2] %s: allocation failed for buffer: %d\n",
++			__func__, attachment);
++		goto err_out;
++	    }
++	    pPriv->buffers = newBuffers;
++	    memset(&pPriv->buffers[pPriv->bufferCount], 0,
++		    (n - pPriv->bufferCount) * sizeof(pPriv->buffers[0]));
++	    pPriv->bufferCount = n;
++	}
++
++	/* destroy any previous buffer at this attachment slot */
++	if (pPriv->buffers[attachment]) {
++	    (*ds->DestroyBuffer)(pDraw, pPriv->buffers[attachment]);
++	    pPriv->buffers[attachment] = NULL;
++	}
++
++	if ((width == 0) && (height == 0)) {
++	    /* client just wanted us to delete the buffer */
++	    continue;
++	}
++
++	if (!valid_format(ds, format)) {
++	    xf86DrvMsg(pDraw->pScreen->myNum, X_ERROR,
++		    "[DRI2] %s: bad format: %d\n", __func__, format);
++	    goto err_out;
++	}
++
++	if (attachment == DRI2BufferFrontLeft) {
++	    buf = (*ds->CreateBuffer)(pDraw, attachment, format);
++	    /* note: don't expose front buffer to client */
++	} else {
++	    buf = (*ds->CreateBufferVid)(pDraw, attachment, format, width, height);
++	    buffers[n++] = buf;
++	}
++
++	if (! buf) {
++	    goto err_out;
++	}
++
++	pPriv->buffers[attachment] = buf;
++    }
++
++    *out_count = n;
++
++    return buffers;
++
++err_out:
++
++    *out_count = 0;
++
++    for (i = 0; i < n; i++)
++	if (buffers[i])
++	    pPriv->buffers[buffers[i]->attachment] = NULL;
++
++    destroy_buffers(pDraw, buffers, n);
++
++    return NULL;
++}
++
+ static void
+ DRI2InvalidateDrawable(DrawablePtr pDraw)
+ {
+@@ -549,7 +700,7 @@
+     pPriv->needInvalidate = FALSE;
+ 
+     list_for_each_entry(ref, &pPriv->reference_list, link)
+-	ref->invalidate(pDraw, ref->priv);
++	ref->invalidate(pDraw, ref->priv, ref->id);
+ }
+ 
+ /*
+@@ -609,22 +760,14 @@
+ {
+     DRI2ScreenPtr   ds = DRI2GetScreen(pDraw->pScreen);
+     DRI2DrawablePtr pPriv;
+-    DRI2BufferPtr   pDestBuffer, pSrcBuffer;
+-    int		    i;
++    DRI2BufferPtr   pDestBuffer = NULL, pSrcBuffer = NULL;
+ 
+     pPriv = DRI2GetDrawable(pDraw);
+     if (pPriv == NULL)
+ 	return BadDrawable;
+ 
+-    pDestBuffer = NULL;
+-    pSrcBuffer = NULL;
+-    for (i = 0; i < pPriv->bufferCount; i++)
+-    {
+-	if (pPriv->buffers[i]->attachment == dest)
+-	    pDestBuffer = (DRI2BufferPtr) pPriv->buffers[i];
+-	if (pPriv->buffers[i]->attachment == src)
+-	    pSrcBuffer = (DRI2BufferPtr) pPriv->buffers[i];
+-    }
++    find_attachment(pPriv, dest, &pDestBuffer);
++    find_attachment(pPriv, src, &pSrcBuffer);
+     if (pSrcBuffer == NULL || pDestBuffer == NULL)
+ 	return BadValue;
+ 
+@@ -792,31 +935,41 @@
+     return FALSE;
+ }
+ 
+-int
+-DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
+-		CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
+-		DRI2SwapEventPtr func, void *data)
++/*
++ * A TraverseTree callback to invalidate all windows using the same
++ * pixmap
++ */
++static int
++DRI2InvalidateWalk(WindowPtr pWin, pointer data)
++{
++    if (pWin->drawable.pScreen->GetWindowPixmap(pWin) != data)
++	return WT_DONTWALKCHILDREN;
++    DRI2InvalidateDrawable(&pWin->drawable);
++    return WT_WALKCHILDREN;
++}
++
++static int
++swap_buffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
++	     CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
++	     DRI2SwapEventPtr func, void *data,
++	     Bool vid, unsigned int source, BoxPtr b)
+ {
+     ScreenPtr       pScreen = pDraw->pScreen;
+     DRI2ScreenPtr   ds = DRI2GetScreen(pDraw->pScreen);
+-    DRI2DrawablePtr pPriv;
++    DRI2DrawablePtr pPriv = DRI2GetDrawable(pDraw);
+     DRI2BufferPtr   pDestBuffer = NULL, pSrcBuffer = NULL;
+-    int             ret, i;
++    int             ret;
+     CARD64          ust, current_msc;
+ 
+-    pPriv = DRI2GetDrawable(pDraw);
+-    if (pPriv == NULL) {
++    if ((pPriv == NULL) || (vid && !supports_video(ds))) {
+         xf86DrvMsg(pScreen->myNum, X_ERROR,
+ 		   "[DRI2] %s: bad drawable\n", __func__);
+ 	return BadDrawable;
+     }
+ 
+-    for (i = 0; i < pPriv->bufferCount; i++) {
+-	if (pPriv->buffers[i]->attachment == DRI2BufferFrontLeft)
+-	    pDestBuffer = (DRI2BufferPtr) pPriv->buffers[i];
+-	if (pPriv->buffers[i]->attachment == DRI2BufferBackLeft)
+-	    pSrcBuffer = (DRI2BufferPtr) pPriv->buffers[i];
+-    }
++    find_attachment(pPriv, DRI2BufferFrontLeft, &pDestBuffer);
++    find_attachment(pPriv, source, &pSrcBuffer);
++
+     if (pSrcBuffer == NULL || pDestBuffer == NULL) {
+         xf86DrvMsg(pScreen->myNum, X_ERROR,
+ 		   "[DRI2] %s: drawable has no back or front?\n", __func__);
+@@ -824,7 +977,7 @@
+     }
+ 
+     /* Old DDX or no swap interval, just blit */
+-    if (!ds->ScheduleSwap || !pPriv->swap_interval) {
++    if ((!ds->ScheduleSwap || !pPriv->swap_interval) && !vid) {
+ 	BoxRec box;
+ 	RegionRec region;
+ 
+@@ -860,7 +1013,6 @@
+ 
+ 	    if (current_msc < pPriv->last_swap_target)
+ 		pPriv->last_swap_target = current_msc;
+-
+ 	}
+ 
+ 	/*
+@@ -876,8 +1028,14 @@
+     }
+ 
+     pPriv->swapsPending++;
+-    ret = (*ds->ScheduleSwap)(client, pDraw, pDestBuffer, pSrcBuffer,
+-			      swap_target, divisor, remainder, func, data);
++    if (vid) {
++	DrawablePtr osd = NULL;  // TODO
++	ret = (*ds->ScheduleSwapVid)(client, pDraw, pDestBuffer, pSrcBuffer,
++		b, osd, swap_target, divisor, remainder, func, data);
++    } else {
++	ret = (*ds->ScheduleSwap)(client, pDraw, pDestBuffer, pSrcBuffer,
++		swap_target, divisor, remainder, func, data);
++    }
+     if (!ret) {
+ 	pPriv->swapsPending--; /* didn't schedule */
+         xf86DrvMsg(pScreen->myNum, X_ERROR,
+@@ -892,11 +1050,50 @@
+      */
+     *swap_target = pPriv->swap_count + pPriv->swapsPending;
+ 
++    if (vid) {
++	return Success;
++    }
++
++    if (pDraw->type == DRAWABLE_WINDOW) {
++	WindowPtr	pWin = (WindowPtr) pDraw;
++	PixmapPtr	pPixmap = pScreen->GetWindowPixmap(pWin);
++
++	/*
++	 * Find the top-most window using this pixmap
++	 */
++	while (pWin->parent && pScreen->GetWindowPixmap(pWin->parent) == pPixmap)
++	    pWin = pWin->parent;
++
++	/*
++	 * Walk the sub-tree to invalidate all of the
++	 * windows using the same pixmap
++	 */
++	TraverseTree(pWin, DRI2InvalidateWalk, pPixmap);
++	DRI2InvalidateDrawable(&pPixmap->drawable);
++    } else
+     DRI2InvalidateDrawable(pDraw);
+ 
+     return Success;
+ }
+ 
++int
++DRI2SwapBuffers(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
++		CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
++		DRI2SwapEventPtr func, void *data)
++{
++    return swap_buffers(client, pDraw, target_msc, divisor, remainder,
++	    swap_target, func, data, FALSE, DRI2BufferBackLeft, NULL);
++}
++
++int
++DRI2SwapBuffersVid(ClientPtr client, DrawablePtr pDraw, CARD64 target_msc,
++		CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
++		unsigned int source, BoxPtr b, DRI2SwapEventPtr func, void *data)
++{
++    return swap_buffers(client, pDraw, target_msc, divisor, remainder,
++	    swap_target, func, data, TRUE, source, b);
++}
++
+ void
+ DRI2SwapInterval(DrawablePtr pDrawable, int interval)
+ {
+@@ -1014,6 +1211,77 @@
+     return ds->ScheduleSwap && ds->GetMSC;
+ }
+ 
++#define ATOM(a) MakeAtom(a, sizeof(a) - 1, TRUE)
++
++/* length in multiple of CARD32's, passed in value should be copied by
++ * receiver
++ */
++int
++DRI2SetAttribute(DrawablePtr pDraw, Atom attribute, int len, const CARD32 *val)
++{
++    DRI2ScreenPtr ds = DRI2GetScreen(pDraw->pScreen);
++    int ret = BadMatch;
++
++    if (!supports_video(ds)) {
++	return BadDrawable;
++    }
++
++    if (attribute == ATOM("XV_OSD")) {
++    } else if (ds->SetAttribute) {
++	ret = (*ds->SetAttribute)(pDraw, attribute, len, val);
++    }
++
++    return ret;
++}
++
++/* length in multiple of CARD32's, returned val should *not* be free'd
++ * (unlike similar function on client side) to avoid temporary allocation
++ * and extra copy.
++ */
++int
++DRI2GetAttribute(DrawablePtr pDraw, Atom attribute, int *len, const CARD32 **val)
++{
++    DRI2ScreenPtr ds = DRI2GetScreen(pDraw->pScreen);
++    int ret = BadMatch;
++
++    if (!supports_video(ds)) {
++	return BadDrawable;
++    }
++
++    if (attribute == ATOM("XV_OSD")) {
++    } else if (ds->GetAttribute) {
++	ret = (*ds->GetAttribute)(pDraw, attribute, len, val);
++    }
++
++    return ret;
++}
++
++int
++DRI2GetFormats(ScreenPtr pScreen, unsigned int *nformats, unsigned int **formats)
++{
++    DRI2ScreenPtr ds = DRI2GetScreen(pScreen);
++
++    if (! supports_video(ds)) {
++	return BadDrawable;
++    }
++
++    *nformats = ds->numFormats;
++    *formats  = ds->formats;
++
++    return Success;
++}
++
++unsigned int
++DRI2GetExtraBufferNames(DrawablePtr pDraw, DRI2BufferPtr buf,
++	unsigned int **names, unsigned int **pitches)
++{
++    DRI2ScreenPtr ds = DRI2GetScreen(pDraw->pScreen);
++    if (ds->GetExtraBufferNames) {
++	return (*ds->GetExtraBufferNames)(pDraw, buf, names, pitches);
++    }
++    return 0;
++}
++
+ Bool
+ DRI2Connect(ScreenPtr pScreen, unsigned int driverType, int *fd,
+ 	    const char **driverName, const char **deviceName)
+@@ -1081,9 +1349,10 @@
+     const char* driverTypeNames[] = {
+ 	"DRI", /* DRI2DriverDRI */
+ 	"VDPAU", /* DRI2DriverVDPAU */
++	"XV", /* DRI2DriverXV */
+     };
+     unsigned int i;
+-    CARD8 cur_minor;
++    CARD8 cur_minor = 1;
+ 
+     if (info->version < 3)
+ 	return FALSE;
+@@ -1121,14 +1390,45 @@
+ 	ds->ScheduleWaitMSC = info->ScheduleWaitMSC;
+ 	ds->GetMSC = info->GetMSC;
+ 	cur_minor = 3;
+-    } else {
+-	cur_minor = 1;
+     }
+ 
+     if (info->version >= 5) {
+         ds->AuthMagic = info->AuthMagic;
+     }
+ 
++    if (info->version >= 6) {
++	ds->ReuseBufferNotify = info->ReuseBufferNotify;
++	ds->SwapLimitValidate = info->SwapLimitValidate;
++    }
++
++    if (info->version >= 7) {
++	if ((info->numDrivers > DRI2DriverXV) &&
++		info->driverNames[DRI2DriverXV]) {
++	    /* if driver claims to support DRI2DriverXV, then ensure
++	     * it provides the required fxn ptrs:
++	     */
++	    if (!info->CreateBufferVid || !info->ScheduleSwapVid) {
++		xf86DrvMsg(pScreen->myNum, X_WARNING,
++			"[DRI2] DRI2DriverXV must implement "
++			"CreateBuffersVid and ScheduleSwapVid.\n");
++		goto err_out;
++	    }
++	}
++	ds->numFormats = info->numFormats;
++	ds->formats = malloc(info->numFormats * sizeof(*ds->formats));
++	if (!ds->formats)
++	    goto err_out;
++	memcpy(ds->formats, info->formats,
++		info->numFormats * sizeof(*ds->formats));
++	ds->GetExtraBufferNames = info->GetExtraBufferNames;
++	ds->CreateBufferVid = info->CreateBufferVid;
++	ds->ScheduleSwapVid = info->ScheduleSwapVid;
++	ds->SetAttribute = info->SetAttribute;
++	ds->GetAttribute = info->GetAttribute;
++
++	cur_minor = 4;
++    }
++
+     /*
+      * if the driver doesn't provide an AuthMagic function or the info struct
+      * version is too low, it relies on the old method (using libdrm) or fail
+@@ -1178,6 +1478,10 @@
+ err_out:
+     xf86DrvMsg(pScreen->myNum, X_WARNING,
+             "[DRI2] Initialization failed for info version %d.\n", info->version);
++    if (ds) {
++	free(ds->formats);
++	free(ds->driverNames);
++    }
+     free(ds);
+     return FALSE;
+ }
+Index: xserver/hw/xfree86/dri2/dri2.h
+===================================================================
+--- xserver.orig/hw/xfree86/dri2/dri2.h	2012-02-22 11:04:26.000000000 +0100
++++ xserver/hw/xfree86/dri2/dri2.h	2012-02-22 16:31:43.000000000 +0100
+@@ -104,12 +104,73 @@
+ 						   CARD64 remainder,
+ 						   DRI2SwapEventPtr func,
+ 						   void *data);
++
++/**
++ * Schedule a video buffer swap
++ *
++ * Drivers should queue an event for the frame count that satisfies the
++ * parameters passed in.  If the event is in the future (i.e. the conditions
++ * aren't currently satisfied), the server may block the client at the next
++ * GLX request using DRI2WaitSwap. When the event arrives, drivers should call
++ * \c DRI2SwapComplete, which will handle waking the client and returning
++ * the appropriate data.
++ *
++ * The DDX is responsible for doing an overlay buffer flip/exchange, or
++ * scaling/colorconvert blit when the corresponding event arrives.
++ *
++ * If the target drawable is resized/damaged, or the osd pixmap is changed/
++ * damaged, ScheduleSwapVid can be re-invoked by the core with the same
++ * source buffer to repair the dri2 video drawable.
++ * XXX TODO this part isn't implemented in core yet..
++ *
++ * \param client client pointer (used for block/unblock)
++ * \param pDraw drawable whose count we want
++ * \param pDestBuffer current front buffer
++ * \param pSrcBuffer current back buffer
++ * \param b the crop box
++ * \param osd the on-screen-display overlay pixmap, should be an ARGB pixmap
++ *   that is blended on top of the video as part of swap.  Multiple layers
++ *   to blend over the video should be flattened into a single layer by the
++ *   client
++ * \param target_msc frame count to wait for
++ * \param divisor divisor for condition equation
++ * \param remainder remainder for division equation
++ * \param func function to call when the swap completes
++ * \param data data for the callback \p func.
++ */
++typedef int		(*DRI2ScheduleSwapVidProcPtr)(ClientPtr client,
++						   DrawablePtr pDraw,
++						   DRI2BufferPtr pDestBuffer,
++						   DRI2BufferPtr pSrcBuffer,
++						   BoxPtr b,
++						   DrawablePtr osd,
++						   CARD64 *target_msc,
++						   CARD64 divisor,
++						   CARD64 remainder,
++						   DRI2SwapEventPtr func,
++						   void *data);
++
+ typedef DRI2BufferPtr	(*DRI2CreateBufferProcPtr)(DrawablePtr pDraw,
+ 						   unsigned int attachment,
+ 						   unsigned int format);
++typedef DRI2BufferPtr	(*DRI2CreateBufferVidProcPtr)(DrawablePtr pDraw,
++						   unsigned int attachment,
++						   unsigned int format,
++						   unsigned int width,
++						   unsigned int height);
+ typedef void		(*DRI2DestroyBufferProcPtr)(DrawablePtr pDraw,
+ 						    DRI2BufferPtr buffer);
+ /**
++ * Notifies driver when DRI2GetBuffers reuses a dri2 buffer.
++ *
++ * Driver may rename the dri2 buffer in this notify if it is required.
++ *
++ * \param pDraw drawable whose count we want
++ * \param buffer buffer that will be returned to client
++ */
++typedef void		(*DRI2ReuseBufferNotifyProcPtr)(DrawablePtr pDraw,
++						      DRI2BufferPtr buffer);
++/**
+  * Get current media stamp counter values
+  *
+  * This callback is used to support the SGI_video_sync and OML_sync_control
+@@ -156,12 +217,62 @@
+ 						      CARD64 remainder);
+ 
+ typedef void		(*DRI2InvalidateProcPtr)(DrawablePtr pDraw,
+-						 void *data);
++						 void *data,
++						 XID id);
++
++/**
++ * DRI2 calls this hook when ever swap_limit is going to be changed. Default
++ * implementation for the hook only accepts one as swap_limit. If driver can
++ * support other swap_limits it has to implement supported limits with this
++ * callback.
++ *
++ * \param pDraw drawable whos swap_limit is going to be changed
++ * \param swap_limit new swap_limit that going to be set
++ * \return TRUE if limit is support, FALSE if not.
++ */
++typedef Bool		(*DRI2SwapLimitValidateProcPtr)(DrawablePtr pDraw,
++							int swap_limit);
++
++
++/**
++ * An ugly approach to avoid changing DRI2BufferPtr and cause ABI breakage
++ * between driver and xserver.  This only needs to be implemented by drivers
++ * supporting planar formats with one buffer per plane.
++ *
++ * This might be a good argument for having drivers in-tree ;-)
++ *
++ * \param pDraw drawable that the buffer belongs to
++ * \param buf the DRI2 buffer
++ * \param names array of buffer names
++ * \param pitches array of buffer pitches
++ * \return the number of additional buffers, ie. for I420 tri-planar buffer,
++ * if represented as multiple buffer names, the Y buffer name would be in
++ * buf->name, this function would return 2, and return the U and V buffer
++ * names by reference.
++ */
++typedef unsigned int	(*DRI2GetExtraBufferNamesProcPtr)(DrawablePtr pDraw,
++	DRI2BufferPtr buf, unsigned int **names, unsigned int **pitches);
++
++/**
++ * Length in multiple of CARD32's, passed in value should be copied by
++ * receiver
++ */
++typedef int (*DRI2SetAttributeProcPtr)(DrawablePtr pDraw, Atom attribute,
++	int len, const CARD32 *val);
++
++/**
++ * Length in multiple of CARD32's, returned val should *not* be free'd
++ * (unlike similar function on client side) to avoid temporary allocation
++ * and extra copy.
++ */
++typedef int (*DRI2GetAttributeProcPtr)(DrawablePtr pDraw, Atom attribute,
++	int *len, const CARD32 **val);
++
+ 
+ /**
+  * Version of the DRI2InfoRec structure defined in this header
+  */
+-#define DRI2INFOREC_VERSION 5
++#define DRI2INFOREC_VERSION 7
+ 
+ typedef struct {
+     unsigned int version;	/**< Version of this struct */
+@@ -189,6 +300,20 @@
+     /* added in version 5 */
+ 
+     DRI2AuthMagicProcPtr	AuthMagic;
++    /* added in version 6 */
++
++    DRI2ReuseBufferNotifyProcPtr ReuseBufferNotify;
++    DRI2SwapLimitValidateProcPtr SwapLimitValidate;
++
++    /* added in version 7 */
++
++    unsigned int numFormats;
++    const unsigned int *formats;
++    DRI2GetExtraBufferNamesProcPtr GetExtraBufferNames;
++    DRI2CreateBufferVidProcPtr	CreateBufferVid;
++    DRI2ScheduleSwapVidProcPtr	ScheduleSwapVid;
++    DRI2SetAttributeProcPtr	SetAttribute;
++    DRI2GetAttributeProcPtr	GetAttribute;
+ }  DRI2InfoRec, *DRI2InfoPtr;
+ 
+ extern _X_EXPORT int DRI2EventBase;
+@@ -250,11 +375,19 @@
+ 	int *width, int *height, unsigned int *attachments, int count,
+ 	int *out_count);
+ 
++extern _X_EXPORT DRI2BufferPtr * DRI2GetBuffersVid(DrawablePtr pDraw,
++	int width, int height, unsigned int *attachments, int count,
++	int *out_count);
++
+ extern _X_EXPORT void DRI2SwapInterval(DrawablePtr pDrawable, int interval);
++extern _X_EXPORT Bool DRI2SwapLimit(DrawablePtr pDraw, int swap_limit);
+ extern _X_EXPORT int DRI2SwapBuffers(ClientPtr client, DrawablePtr pDrawable,
+ 				     CARD64 target_msc, CARD64 divisor,
+ 				     CARD64 remainder, CARD64 *swap_target,
+ 				     DRI2SwapEventPtr func, void *data);
++extern _X_EXPORT int DRI2SwapBuffersVid(ClientPtr client, DrawablePtr pDraw,
++	CARD64 target_msc, CARD64 divisor, CARD64 remainder, CARD64 *swap_target,
++	unsigned int source, BoxPtr b, DRI2SwapEventPtr func, void *data);
+ extern _X_EXPORT Bool DRI2WaitSwap(ClientPtr client, DrawablePtr pDrawable);
+ 
+ extern _X_EXPORT int DRI2GetMSC(DrawablePtr pDrawable, CARD64 *ust,
+@@ -284,4 +417,22 @@
+ 					  int frame, unsigned int tv_sec,
+ 					  unsigned int tv_usec);
+ 
++extern _X_EXPORT int DRI2SetAttribute(DrawablePtr pDraw, Atom attribute,
++	int len, const CARD32 *val);
++extern _X_EXPORT int DRI2GetAttribute(DrawablePtr pDraw, Atom attribute,
++	int *len, const CARD32 **val);
++extern _X_EXPORT int DRI2GetFormats(ScreenPtr pScreen,
++	unsigned int *nformats, unsigned int **formats);
++
++extern _X_EXPORT unsigned int DRI2GetExtraBufferNames(DrawablePtr pDraw,
++	DRI2BufferPtr buf, unsigned int **names, unsigned int **pitches);
++
++
++/* some utility macros.. maybe could go elsewhere? */
++#define FOURCC(a, b, c, d) (((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24 )))
++#define FOURCC_STR(str)    FOURCC(str[0], str[1], str[2], str[3])
++#ifndef ARRAY_SIZE
++#  define ARRAY_SIZE(_a)   (sizeof((_a)) / sizeof((_a)[0]))
++#endif
++
+ #endif
+Index: xserver/hw/xfree86/dri2/dri2ext.c
+===================================================================
+--- xserver.orig/hw/xfree86/dri2/dri2ext.c	2012-02-22 11:04:26.000000000 +0100
++++ xserver/hw/xfree86/dri2/dri2ext.c	2012-02-22 16:37:21.000000000 +0100
+@@ -78,6 +78,7 @@
+ 	swaps(&stuff->length, n);
+ 
+     REQUEST_SIZE_MATCH(xDRI2QueryVersionReq);
++
+     rep.type = X_Reply;
+     rep.length = 0;
+     rep.sequenceNumber = client->sequence;
+@@ -157,7 +158,7 @@
+ }
+ 
+ static void
+-DRI2InvalidateBuffersEvent(DrawablePtr pDraw, void *priv)
++DRI2InvalidateBuffersEvent(DrawablePtr pDraw, void *priv, XID id)
+ {
+     xDRI2InvalidateBuffers event;
+     ClientPtr client = priv;
+@@ -206,12 +207,13 @@
+ 
+ 
+ static int
+-send_buffers_reply(ClientPtr client, DrawablePtr pDrawable,
++send_buffers_reply(ClientPtr client, DrawablePtr pDrawable, int vid,
+ 		   DRI2BufferPtr *buffers, int count, int width, int height)
+ {
+     xDRI2GetBuffersReply rep;
+-    int skip = 0;
+-    int i;
++    int skip = 0, extra = 0;
++    unsigned int *names, *pitches;
++    int i, j;
+ 
+     if (buffers == NULL)
+ 	    return BadAlloc;
+@@ -227,8 +229,24 @@
+ 	}
+     }
+ 
++    if (vid) {
++	extra = 4 * (count - skip);
++
++	for (i = 0; i < count; i++) {
++	    /* Do not send the real front buffer of a window to the client.
++	     */
++	    if ((pDrawable->type == DRAWABLE_WINDOW)
++		    && (buffers[i]->attachment == DRI2BufferFrontLeft)) {
++		continue;
++	    }
++
++	    extra += 8 * DRI2GetExtraBufferNames(pDrawable, buffers[i],
++		    &names, &pitches);
++	}
++    }
++
+     rep.type = X_Reply;
+-    rep.length = (count - skip) * sizeof(xDRI2Buffer) / 4;
++    rep.length = ((count - skip) * sizeof(xDRI2Buffer) + extra) / 4;
+     rep.sequenceNumber = client->sequence;
+     rep.width = width;
+     rep.height = height;
+@@ -251,6 +269,17 @@
+ 	buffer.cpp = buffers[i]->cpp;
+ 	buffer.flags = buffers[i]->flags;
+ 	WriteToClient(client, sizeof(xDRI2Buffer), &buffer);
++
++	if (vid) {
++	    CARD32 n = DRI2GetExtraBufferNames(pDrawable, buffers[i],
++		    &names, &pitches);
++	    WriteToClient(client, sizeof(n), &n);
++	    for (j = 0; j < n; j++) {
++		CARD32 name = names[j], pitch = pitches[j];
++		WriteToClient(client, sizeof(name), &name);
++		WriteToClient(client, sizeof(pitch), &pitch);
++	    }
++	}
+     }
+     return Success;
+ }
+@@ -278,8 +307,8 @@
+ 			     attachments, stuff->count, &count);
+ 
+ 
+-    return send_buffers_reply(client, pDrawable, buffers, count, width, height);
+-
++    return send_buffers_reply(client, pDrawable, FALSE,
++	    buffers, count, width, height);
+ }
+ 
+ static int
+@@ -303,7 +332,40 @@
+     buffers = DRI2GetBuffersWithFormat(pDrawable, &width, &height,
+ 				       attachments, stuff->count, &count);
+ 
+-    return send_buffers_reply(client, pDrawable, buffers, count, width, height);
++    return send_buffers_reply(client, pDrawable, FALSE,
++	    buffers, count, width, height);
++}
++
++static int
++ProcDRI2GetBuffersVid(ClientPtr client)
++{
++    REQUEST(xDRI2GetBuffersVidReq);
++    DrawablePtr pDrawable;
++    DRI2BufferPtr *buffers;
++    int status, count;
++    unsigned int *attachments;
++
++    REQUEST_FIXED_SIZE(xDRI2GetBuffersVidReq, stuff->count * (2 * 4));
++    if (!validDrawable(client, stuff->drawable, DixReadAccess | DixWriteAccess,
++		       &pDrawable, &status))
++	return status;
++
++    if (DRI2ThrottleClient(client, pDrawable))
++	return Success;
++
++    attachments = (unsigned int *) &stuff[1];
++    buffers = DRI2GetBuffersVid(pDrawable, stuff->width, stuff->height,
++				attachments, stuff->count, &count);
++
++    status = send_buffers_reply(client, pDrawable, TRUE, buffers, count, 0, 0);
++
++    /* note, unlike other DRI2GetBuffers variants, we allow requesting/
++     * returning just a subset of buffers.. so array that is returned is
++     * not the one held in pPriv, so must be free'd
++     */
++    free(buffers);
++
++    return status;
+ }
+ 
+ static int
+@@ -416,6 +478,53 @@
+     return Success;
+ }
+ 
++static int
++ProcDRI2SwapBuffersVid(ClientPtr client)
++{
++    REQUEST(xDRI2SwapBuffersVidReq);
++    xDRI2SwapBuffersReply rep;
++    DrawablePtr pDrawable;
++    CARD64 target_msc, divisor, remainder, swap_target;
++    BoxRec b;
++    int status;
++
++    REQUEST_SIZE_MATCH(xDRI2SwapBuffersVidReq);
++
++    if (!validDrawable(client, stuff->drawable,
++		       DixReadAccess | DixWriteAccess, &pDrawable, &status))
++	return status;
++
++    /*
++     * Ensures an out of control client can't exhaust our swap queue, and
++     * also orders swaps.
++     */
++    if (DRI2ThrottleClient(client, pDrawable))
++	return Success;
++
++    target_msc = vals_to_card64(stuff->target_msc_lo, stuff->target_msc_hi);
++    divisor = vals_to_card64(stuff->divisor_lo, stuff->divisor_hi);
++    remainder = vals_to_card64(stuff->remainder_lo, stuff->remainder_hi);
++
++    b.x1 = stuff->x1;
++    b.y1 = stuff->y1;
++    b.x2 = stuff->x2;
++    b.y2 = stuff->y2;
++
++    status = DRI2SwapBuffersVid(client, pDrawable, target_msc, divisor, remainder,
++	    &swap_target, stuff->source, &b, DRI2SwapEvent, pDrawable);
++    if (status != Success)
++	return BadDrawable;
++
++    rep.type = X_Reply;
++    rep.length = 0;
++    rep.sequenceNumber = client->sequence;
++    load_swap_reply(&rep, swap_target);
++
++    WriteToClient(client, sizeof(xDRI2SwapBuffersReply), &rep);
++
++    return Success;
++}
++
+ static void
+ load_msc_reply(xDRI2MSCReply *rep, CARD64 ust, CARD64 msc, CARD64 sbc)
+ {
+@@ -539,6 +648,87 @@
+ }
+ 
+ static int
++ProcDRI2SetAttribute(ClientPtr client)
++{
++    REQUEST(xDRI2SetAttributeReq);
++    DrawablePtr pDrawable;
++    int status;
++    int len = (stuff->length * 4 - sizeof(xDRI2SetAttributeReq)) / 4;
++
++    REQUEST_FIXED_SIZE(xDRI2SetAttributeReq, len * 4);
++
++    if (!validDrawable(client, stuff->drawable,
++	    DixReadAccess | DixWriteAccess, &pDrawable, &status))
++	return status;
++
++    status = DRI2SetAttribute(pDrawable, stuff->attribute, len,
++	    (const CARD32 *)&stuff[1]);
++    if (status != Success)
++	return status;
++
++    return Success;
++}
++
++static int
++ProcDRI2GetAttribute(ClientPtr client)
++{
++    REQUEST(xDRI2GetAttributeReq);
++    xDRI2GetAttributeReply rep;
++    DrawablePtr pDrawable;
++    const CARD32 *val;
++    int status, len;
++
++    REQUEST_SIZE_MATCH(xDRI2GetAttributeReq);
++
++    if (!validDrawable(client, stuff->drawable, DixReadAccess, &pDrawable,
++	    &status))
++	return status;
++
++    status = DRI2GetAttribute(pDrawable, stuff->attribute, &len, &val);
++    if (status != Success)
++	return status;
++
++    rep.type = X_Reply;
++    rep.length = len;
++    rep.sequenceNumber = client->sequence;
++    WriteToClient(client, sizeof(xDRI2GetAttributeReply), &rep);
++    WriteToClient(client, len * 4, val);
++
++    return Success;
++}
++
++static int
++ProcDRI2GetFormats(ClientPtr client)
++{
++    REQUEST(xDRI2GetFormatsReq);
++    xDRI2GetFormatsReply rep;
++    DrawablePtr pDrawable;
++    unsigned int i, nformats, *formats;
++    int status;
++
++    REQUEST_SIZE_MATCH(xDRI2GetFormatsReq);
++
++    if (!validDrawable(client, stuff->drawable, DixReadAccess, &pDrawable,
++	    &status))
++	return status;
++
++    status = DRI2GetFormats(pDrawable->pScreen, &nformats, &formats);
++    if (status != Success)
++	return status;
++
++    rep.type = X_Reply;
++    rep.length = nformats * sizeof(*formats) / 4;
++    rep.sequenceNumber = client->sequence;
++    WriteToClient(client, sizeof(xDRI2GetFormatsReply), &rep);
++
++    for (i = 0; i < nformats; i++) {
++	WriteToClient(client, sizeof(formats[i]), &formats[i]);
++    }
++
++    return Success;
++}
++
++static int
+ ProcDRI2Dispatch (ClientPtr client)
+ {
+     REQUEST(xReq);
+@@ -576,6 +766,16 @@
+ 	return ProcDRI2WaitSBC(client);
+     case X_DRI2SwapInterval:
+ 	return ProcDRI2SwapInterval(client);
++    case X_DRI2GetBuffersVid:
++	return ProcDRI2GetBuffersVid(client);
++    case X_DRI2SwapBuffersVid:
++	return ProcDRI2SwapBuffersVid(client);
++    case X_DRI2SetAttribute:
++	return ProcDRI2SetAttribute(client);
++    case X_DRI2GetAttribute:
++	return ProcDRI2GetAttribute(client);
++    case X_DRI2GetFormats:
++	return ProcDRI2GetFormats(client);
+     default:
+ 	return BadRequest;
+     }
