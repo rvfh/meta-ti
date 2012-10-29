@@ -1,0 +1,21 @@
+From 681d70b8e0523235f52cc6a3667bcdac3851de5c Mon Sep 17 00:00:00 2001
+From: Xavier Boudet <x-boudet@ti.com>
+Date: Tue, 7 Aug 2012 15:29:39 +0200
+Subject: [PATCH 6/6] UBUNTU: Add Headers for dev package
+
+Signed-off-by: Xavier Boudet <x-boudet@ti.com>
+---
+ src/Makefile.am |    3 +++
+ 1 file changed, 3 insertions(+)
+
+Index: xf86-video-omap/src/Makefile.am
+===================================================================
+--- xf86-video-omap.orig/src/Makefile.am	2012-10-18 11:09:26.000000000 +0200
++++ xf86-video-omap/src/Makefile.am	2012-10-18 11:13:52.881500166 +0200
+@@ -53,3 +53,6 @@
+          omap_driver.h \
+          omap_util.h \
+          compat-api.h
++
++omap_drvincludedir = ${includedir}
++omap_drvinclude_HEADERS = omap_driver.h omap_exa.h omap_util.h compat-api.h

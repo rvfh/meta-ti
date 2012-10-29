@@ -1,0 +1,31 @@
+From 2c43f9e5b3072c996190f86da916ffe445af9485 Mon Sep 17 00:00:00 2001
+From: Xavier Boudet <x-boudet@ti.com>
+Date: Thu, 18 Oct 2012 15:18:50 +0200
+Subject: [PATCH] Fix WIP: dri2video (v5)
+
+Signed-off-by: Xavier Boudet <x-boudet@ti.com>
+---
+ src/omap_dri2.c |    7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/omap_dri2.c b/src/omap_dri2.c
+index 41976e5..0efa162 100644
+--- a/src/omap_dri2.c
++++ b/src/omap_dri2.c
+@@ -468,6 +468,13 @@ OMAPDRI2CopyRegion(DrawablePtr pDraw, RegionPtr pRegion,
+ 	DEBUG_MSG("pDraw=%p, pDstBuffer=%p (%p), pSrcBuffer=%p (%p)",
+ 			pDraw, pDstBuffer, pSrcDraw, pSrcBuffer, pDstDraw);
+ 
++	if (pDstBuffer->attachment == DRI2BufferFakeFrontLeft) {
++		/* I think we don't need this.. it should be handled
++		 * on client side (I think)..
++		 */
++		return;
++	}
++
+ 	pGC = GetScratchGC(pDstDraw->depth, pScreen);
+ 	if (!pGC) {
+ 		return;
+-- 
+1.7.9.5
+
