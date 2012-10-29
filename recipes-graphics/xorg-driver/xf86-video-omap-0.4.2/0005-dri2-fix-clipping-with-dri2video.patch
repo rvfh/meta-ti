@@ -1,0 +1,70 @@
+From 25e1fa5bfd5e85b596aa0768ef45a5a209d94d14 Mon Sep 17 00:00:00 2001
+From: Rob Clark <rob@ti.com>
+Date: Wed, 17 Oct 2012 12:33:40 -0500
+Subject: [PATCH 5/5] dri2: fix clipping with dri2video
+
+Signed-off-by: Rob Clark <rob@ti.com>
+---
+ src/omap_dri2.c |   21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/src/omap_dri2.c b/src/omap_dri2.c
+index c33c3b9..41976e5 100644
+--- a/src/omap_dri2.c
++++ b/src/omap_dri2.c
+@@ -764,8 +764,10 @@ OMAPDRI2ScheduleSwapVid(ClientPtr client, DrawablePtr pDraw,
+ 	OMAPDRI2DrawablePtr pPriv = OMAPDRI2GetDrawable(pDraw);
+ 	OMAPDRISwapCmd *cmd = calloc(1, sizeof(*cmd));
+ 	OMAPPtr pOMAP = OMAPPTR(pScrn);
+-	RegionPtr pCopyClip;
++	RegionRec WinRegion;
++	RegionRec ClipRegion;
+ 	GCPtr pGC;
++	Bool ret = FALSE;
+ 	BoxRec dstbox = {
+ 			.x1 = pDraw->x, .y1 = pDraw->y,
+ 			.x2 = pDraw->x + pDraw->width, .y2 = pDraw->y + pDraw->height
+@@ -798,19 +800,20 @@ OMAPDRI2ScheduleSwapVid(ClientPtr client, DrawablePtr pDraw,
+ 	OMAPDRI2ReferenceBuffer(pDstBuffer);
+ 	pPriv->pending_swaps++;
+ 
+-	pCopyClip = RegionCreate(&dstbox, 1);
+-	(*pGC->funcs->ChangeClip) (pGC, CT_REGION, pCopyClip, 0);
+ 	ValidateGC(pDraw, pGC);
++	RegionInit(&WinRegion, &dstbox, 1);
++	RegionNull(&ClipRegion);
++	RegionIntersect(&ClipRegion, &WinRegion, pGC->pCompositeClip);
+ 
+ 	/* someday, support overlay too.. */
+ 	if (has_video(pOMAP)) {
+ 		cmd->type = DRI2_BLIT_COMPLETE;
+ 		if (OMAPVidCopyArea(dri2draw(pDraw, pSrcBuffer), pSrcBox,
+ 				osd, &osdbox, dri2draw(pDraw, pDstBuffer), &dstbox,
+-				OMAPDRI2PutTextureImage, cmd, pCopyClip) == Success) {
++				OMAPDRI2PutTextureImage, cmd, &ClipRegion) == Success) {
+ 			OMAPDRI2SwapComplete(cmd);
+-			FreeScratchGC(pGC);
+-			return TRUE;
++			ret = TRUE;
++			goto out;
+ 		}
+ 	}
+ 
+@@ -823,9 +826,13 @@ OMAPDRI2ScheduleSwapVid(ClientPtr client, DrawablePtr pDraw,
+ 	OMAPDRI2DestroyBuffer(pDraw, cmd->pSrcBuffer);
+ 	OMAPDRI2DestroyBuffer(pDraw, cmd->pDstBuffer);
+ 	pPriv->pending_swaps--;
++
++out:
++	RegionUninit(&WinRegion);
++	RegionUninit(&ClipRegion);
+ 	FreeScratchGC(pGC);
+ 
+-	return FALSE;
++	return ret;
+ }
+ 
+ /**
+-- 
+1.7.9.5
+

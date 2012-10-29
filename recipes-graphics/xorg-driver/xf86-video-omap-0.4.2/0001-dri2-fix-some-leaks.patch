@@ -1,0 +1,43 @@
+From 653ccadb38c87be565df3fbf2ff24a0cbe5a5e98 Mon Sep 17 00:00:00 2001
+From: Rob Clark <rob@ti.com>
+Date: Tue, 16 Oct 2012 14:51:15 -0500
+Subject: [PATCH 1/5] dri2: fix some leaks
+
+Signed-off-by: Rob Clark <rob@ti.com>
+---
+ src/omap_dri2.c |    5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/omap_dri2.c b/src/omap_dri2.c
+index 6c90f27..7928332 100644
+--- a/src/omap_dri2.c
++++ b/src/omap_dri2.c
+@@ -66,6 +66,8 @@ typedef struct {
+ #define OMAPBUF(p)	((OMAPDRI2BufferPtr)(p))
+ #define DRIBUF(p)	((DRI2BufferPtr)(&(p)->base))
+ 
++static void OMAPDRI2DestroyBuffer(DrawablePtr pDraw, DRI2BufferPtr buffer);
++
+ /* ************************************************************************* */
+ 
+ /**
+@@ -279,7 +281,7 @@ OMAPDRI2CreateBuffer(DrawablePtr pDraw, unsigned int attachment,
+ 	ret = omap_bo_get_name(bo, &DRIBUF(buf)->name);
+ 	if (ret) {
+ 		ERROR_MSG("could not get buffer name: %d", ret);
+-		/* TODO cleanup */
++		OMAPDRI2DestroyBuffer(pDraw, DRIBUF(buf));
+ 		return NULL;
+ 	}
+ 
+@@ -454,6 +456,7 @@ OMAPDRI2SwapDispatch(DrawablePtr pDraw, OMAPDRISwapCmd *cmd)
+ 		RegionInit(&region, &box, 0);
+ 		OMAPDRI2CopyRegion(pDraw, &region,
+ 				cmd->pDstBuffer, cmd->pSrcBuffer);
++		RegionUninit(&region);
+ 		cmd->type = DRI2_BLIT_COMPLETE;
+ 	}
+ 
+-- 
+1.7.9.5
+
